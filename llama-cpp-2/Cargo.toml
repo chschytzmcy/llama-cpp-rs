@@ -42,12 +42,13 @@ system-ggml = ["llama-cpp-sys-2/system-ggml"]
 system-ggml-static = ["llama-cpp-sys-2/system-ggml-static"]
 llguidance = ["dep:llguidance", "dep:toktrie"]
 dynamic-backends = ["llama-cpp-sys-2/dynamic-backends"]
+prebuilt = ["llama-cpp-sys-2/prebuilt"]
 
 
-[target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies]
-llama-cpp-sys-2 = { path = "../llama-cpp-sys-2", version = "0.1.147", features = [
-    "metal",
-] }
+[target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies.llama-cpp-sys-2]
+path = "../llama-cpp-sys-2"
+version = "0.1.147"
+features = ["metal"]
 
 [lints]
 workspace = true

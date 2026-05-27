@@ -832,6 +832,92 @@ fn main() {
         // BUILD_SHARED_LIBS=ON is already set above via the dynamic-link feature.
     }
 
+    // Prebuilt mode: use pre-compiled .so libraries instead of building from source
+    if cfg!(feature = "prebuilt") {
+        let prebuilt_path = env::var("LLAMA_PREBUILT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                // Detect prebuilt dir from target triple and library presence
+                let arch = match target_triple.as_str() {
+                    t if t.contains("x86_64") => "x86_64",
+                    t if t.contains("aarch64") => "aarch64",
+                    t if t.contains("riscv64") => "riscv64",
+                    _ => panic!("Unsupported target for prebuilt: {}", target_triple),
+                };
+                // If x86_64 with cuda libs, prefer cuda path
+                let lib_type = if arch == "x86_64" {
+                    let cuda_lib = PathBuf::from("/home/etsme/cy/rust/lingbase")
+                        .join("lib/x86_64/llama-cpp/cuda/libggml-cuda.so");
+                    if cuda_lib.exists() {
+                        "cuda"
+                    } else {
+                        "cpu"
+                    }
+                } else {
+                    "cpu"
+                };
+                PathBuf::from("/home/etsme/cy/rust/lingbase")
+                    .join(format!("lib/{}/llama-cpp/{}/", arch, lib_type))
+            });
+
+        debug_log!("Prebuilt path: {}", prebuilt_path.display());
+
+        if !prebuilt_path.exists() {
+            panic!("Prebuilt library directory not found: {}", prebuilt_path.display());
+        }
+
+        // Add prebuilt dir to link search
+        println!("cargo:rustc-link-search=native={}", prebuilt_path.display());
+
+        // Link the required shared libraries (skip llama-common which needs OpenSSL)
+        let prebuilt_libs: &[&str] = &["llama", "ggml", "ggml-base", "ggml-cpu", "mtmd"];
+        for lib in prebuilt_libs {
+            if prebuilt_path.join(format!("lib{}.so", lib)).exists()
+                || prebuilt_path.join(format!("lib{}-*.so", lib)).exists()
+            {
+                println!("cargo:rustc-link-lib=dylib={}", lib);
+            }
+        }
+
+        // Link llama-common - it needs OpenSSL at runtime which isn't in the toolchain
+        if prebuilt_path.join("libllama-common.so").exists()
+            || prebuilt_path.join("libllama-common.so.0").exists()
+        {
+            println!("cargo:rustc-link-lib=dylib=llama-common");
+        }
+
+        // Link stdc++ for Linux
+        if matches!(target_os, TargetOs::Linux) {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        }
+
+        // Set GGML_BACKEND_DIR so llama.cpp knows where to find backends at runtime
+        std::env::set_var("GGML_BACKEND_DIR", prebuilt_path.to_string_lossy().to_string());
+
+        // Rerun if prebuilt libs change
+        println!("cargo:rerun-if-changed={}", prebuilt_path.display());
+
+        // Skip cmake build - just compile wrapper and link prebuilt libs
+        common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
+
+        // Write bindings (already generated above)
+        // No-op since bindings were generated before this check,
+        // but keeps rerun-if-changed consistent
+        println!("cargo:rerun-if-changed=wrapper.h");
+        println!("cargo:rerun-if-changed=wrapper_common.h");
+        println!("cargo:rerun-if-changed=wrapper_common.cpp");
+        println!("cargo:rerun-if-changed=wrapper_oai.h");
+        println!("cargo:rerun-if-changed=wrapper_oai.cpp");
+        println!("cargo:rerun-if-changed=wrapper_oai.cpp");
+        println!("cargo:rerun-if-changed=wrapper_utils.h");
+        println!("cargo:rerun-if-changed=wrapper_mtmd.h");
+
+        // Tell Cargo to rerun the build script if any of these change
+        println!("cargo:rerun-if-changed=build.rs");
+
+        return;
+    }
+
     // General
     config
         .profile(&profile)
