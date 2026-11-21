@@ -54,6 +54,9 @@ system-ggml = ["llama-cpp-sys-2/system-ggml"]
 system-ggml-static = ["llama-cpp-sys-2/system-ggml-static"]
 llguidance = ["dep:llguidance", "dep:toktrie"]
 dynamic-backends = ["llama-cpp-sys-2/dynamic-backends"]
+# fork 补丁:LLAMA_PREBUILT_PATH 预编译库直连(lingbase 的静态 libllama 依赖它,
+# 见 llama-cpp-sys-2/build.rs 的 prebuilt 段;上游无此 feature)
+prebuilt = ["llama-cpp-sys-2/prebuilt"]
 
 
 [target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies]
