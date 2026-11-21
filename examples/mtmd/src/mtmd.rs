@@ -17,7 +17,7 @@ use llama_cpp_2::mtmd::{
 };
 
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel, Special};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 /// Command line parameters for the MTMD CLI application
@@ -69,6 +69,12 @@ pub struct MtmdCliParams {
     /// Media marker. If not provided, the default marker will be used.
     #[arg(long = "marker", value_name = "TEXT")]
     pub media_marker: Option<String>,
+    /// Minimum number of tokens used to represent an image (-1 for model default).
+    #[arg(long = "image-min-tokens", value_name = "N", default_value = "-1")]
+    pub image_min_tokens: i32,
+    /// Maximum number of tokens used to represent an image (-1 for model default).
+    #[arg(long = "image-max-tokens", value_name = "N", default_value = "-1")]
+    pub image_max_tokens: i32,
 }
 
 /// State of the MTMD CLI application.
@@ -108,6 +114,8 @@ impl<'a> MtmdCliContext<'a> {
                     .unwrap_or(&llama_cpp_2::mtmd::mtmd_default_marker().to_string())
                     .clone(),
             )?,
+            image_min_tokens: params.image_min_tokens,
+            image_max_tokens: params.image_max_tokens,
         };
 
         let mtmd_ctx = MtmdContext::init_from_file(&params.mmproj_path, model, &mtmd_params)?;
@@ -131,7 +139,7 @@ impl<'a> MtmdCliContext<'a> {
     /// Loads media (image or audio) from the specified file path
     /// # Errors
     pub fn load_media(&mut self, path: &str) -> Result<(), MtmdBitmapError> {
-        let bitmap = MtmdBitmap::from_file(&self.mtmd_ctx, path)?;
+        let bitmap = MtmdBitmap::from_file(&self.mtmd_ctx, path, false)?;
         self.bitmaps.push(bitmap);
         Ok(())
     }
@@ -173,7 +181,7 @@ impl<'a> MtmdCliContext<'a> {
         // Clear bitmaps after tokenization
         self.bitmaps.clear();
 
-        self.n_past = chunks.eval_chunks(&self.mtmd_ctx, context, 0, 0, batch_size, true)?;
+        self.n_past = chunks.eval_chunks(&mut self.mtmd_ctx, context, 0, 0, batch_size, true)?;
         Ok(())
     }
 
@@ -197,14 +205,21 @@ impl<'a> MtmdCliContext<'a> {
             sampler.accept(token);
 
             // Check for end of generation
-            if model.is_eog_token(token) {
+            if model.vocab().is_eog(token) {
                 println!();
                 break;
             }
 
             // Print token
-            let piece = model.token_to_piece(token, &mut decoder, true, None)?;
-            print!("{piece}");
+            let piece = model.vocab().token_to_piece(token, true, None);
+            let mut piece_str =
+                String::with_capacity(decoder.max_utf8_buffer_length(piece.len()).unwrap());
+            let (result, read, _) = decoder.decode_to_string(&piece, &mut piece_str, false);
+            assert!(
+                matches!(result, encoding_rs::CoderResult::InputEmpty) && read == piece.len(),
+                "UTF-8 decoder capacity bound must consume the complete token"
+            );
+            print!("{piece_str}");
             io::stdout().flush()?;
 
             // Prepare next batch

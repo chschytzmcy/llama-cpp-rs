@@ -6,11 +6,12 @@
 //! # Warning
 //! This API is experimental and subject to breaking changes.
 use std::ffi::{CStr, CString};
-use std::ptr::NonNull;
+use std::marker::PhantomData;
 use std::slice;
 
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
+use crate::ptr::Ptr;
 use crate::token::LlamaToken;
 
 /// Input chunk types for multimodal data
@@ -63,6 +64,8 @@ impl From<llama_cpp_sys_2::mtmd_input_chunk_type> for MtmdInputChunkType {
 ///     print_timings: true,
 ///     n_threads: 4,
 ///     media_marker: CString::new(mtmd_default_marker()).unwrap(),
+///     image_min_tokens: -1,
+///     image_max_tokens: -1,
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -75,6 +78,15 @@ pub struct MtmdContextParams {
     pub n_threads: i32,
     /// Media marker string used to identify media positions in text
     pub media_marker: CString,
+    /// Minimum number of tokens used to represent an image.
+    /// Controls the visual token budget lower bound. Use -1 for the model default.
+    /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
+    pub image_min_tokens: i32,
+    /// Maximum number of tokens used to represent an image.
+    /// Controls the visual token budget upper bound. Use -1 for the model default.
+    /// Lower values reduce memory and compute at the cost of visual detail.
+    /// Gemma 4 supported budgets: 70, 140, 280, 560, 1120.
+    pub image_max_tokens: i32,
 }
 
 impl Default for MtmdContextParams {
@@ -91,12 +103,16 @@ impl From<&MtmdContextParams> for llama_cpp_sys_2::mtmd_context_params {
             print_timings,
             n_threads,
             media_marker,
+            image_min_tokens,
+            image_max_tokens,
         } = params;
 
         context.use_gpu = *use_gpu;
         context.print_timings = *print_timings;
         context.n_threads = *n_threads;
         context.media_marker = media_marker.as_ptr();
+        context.image_min_tokens = *image_min_tokens;
+        context.image_max_tokens = *image_max_tokens;
 
         context
     }
@@ -109,6 +125,8 @@ impl From<llama_cpp_sys_2::mtmd_context_params> for MtmdContextParams {
             print_timings: params.print_timings,
             n_threads: params.n_threads,
             media_marker: unsafe { CStr::from_ptr(params.media_marker) }.to_owned(),
+            image_min_tokens: params.image_min_tokens,
+            image_max_tokens: params.image_max_tokens,
         }
     }
 }
@@ -142,11 +160,17 @@ pub struct MtmdInputText {
 /// text, images, and audio through llama.cpp's multimodal interface.
 #[derive(Debug)]
 pub struct MtmdContext {
-    pub(crate) context: NonNull<llama_cpp_sys_2::mtmd_context>,
+    context: Ptr<llama_cpp_sys_2::mtmd_context>,
 }
 
-// MtmdContext is thread safe
+// SAFETY: `mtmd_context` tokenization is thread safe.
+//
+// Note that evaluation and encoding is not thread-safe, but we ensure this
+// doesn't happen on multiple threads by making those methods take `&mut`.
 unsafe impl Send for MtmdContext {}
+// SAFETY: Same as above.
+// Unlike `LlamaContext`, this context doesn't need to synchronize at various
+// points, so there's no danger there.
 unsafe impl Sync for MtmdContext {}
 
 impl MtmdContext {
@@ -183,7 +207,7 @@ impl MtmdContext {
             )
         };
 
-        let context = NonNull::new(context).ok_or(MtmdInitError::NullResult)?;
+        let context = Ptr::new(context).ok_or(MtmdInitError::NullResult)?;
         Ok(Self { context })
     }
 
@@ -270,24 +294,23 @@ impl MtmdContext {
         text: MtmdInputText,
         bitmaps: &[&MtmdBitmap],
     ) -> Result<MtmdInputChunks, MtmdTokenizeError> {
-        let chunks = MtmdInputChunks::new();
+        let mut chunks = MtmdInputChunks::new();
         let text_cstring = CString::new(text.text)?;
         let input_text = llama_cpp_sys_2::mtmd_input_text {
             text: text_cstring.as_ptr(),
+            text_len: text_cstring.as_bytes().len(),
             add_special: text.add_special,
             parse_special: text.parse_special,
         };
 
         // Create bitmap pointers
-        let bitmap_ptrs: Vec<*const llama_cpp_sys_2::mtmd_bitmap> = bitmaps
-            .iter()
-            .map(|b| b.bitmap.as_ptr().cast_const())
-            .collect();
+        let bitmap_ptrs: Vec<*const llama_cpp_sys_2::mtmd_bitmap> =
+            bitmaps.iter().map(|b| b.bitmap.as_ptr()).collect();
 
         let result = unsafe {
             llama_cpp_sys_2::mtmd_tokenize(
                 self.context.as_ptr(),
-                chunks.chunks.as_ptr(),
+                chunks.chunks.as_mut_ptr(),
                 &raw const input_text,
                 bitmap_ptrs.as_ptr().cast_mut(),
                 bitmaps.len(),
@@ -319,9 +342,9 @@ impl MtmdContext {
     /// # Errors
     ///
     /// Returns `MtmdEncodeError::EncodeFailure` if encoding fails.
-    pub fn encode_chunk(&self, chunk: &MtmdInputChunk) -> Result<(), MtmdEncodeError> {
+    pub fn encode_chunk(&mut self, chunk: &MtmdInputChunk<'_>) -> Result<(), MtmdEncodeError> {
         let result = unsafe {
-            llama_cpp_sys_2::mtmd_encode_chunk(self.context.as_ptr(), chunk.chunk.as_ptr())
+            llama_cpp_sys_2::mtmd_encode_chunk(self.context.as_mut_ptr(), chunk.chunk.as_ptr())
         };
 
         if result == 0 {
@@ -334,7 +357,7 @@ impl MtmdContext {
 
 impl Drop for MtmdContext {
     fn drop(&mut self) {
-        unsafe { llama_cpp_sys_2::mtmd_free(self.context.as_ptr()) }
+        unsafe { llama_cpp_sys_2::mtmd_free(self.context.as_mut_ptr()) }
     }
 }
 
@@ -343,13 +366,14 @@ impl Drop for MtmdContext {
 /// Represents bitmap data for images or audio that can be processed
 /// by the multimodal system. For images, data is stored in RGB format.
 /// For audio, data is stored as PCM F32 samples.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MtmdBitmap {
-    pub(crate) bitmap: NonNull<llama_cpp_sys_2::mtmd_bitmap>,
+    bitmap: Ptr<llama_cpp_sys_2::mtmd_bitmap>,
 }
 
-// MtmdBitmap is thread safe
+// SAFETY: `mtmd_bitmap` is thread safe.
 unsafe impl Send for MtmdBitmap {}
+// SAFETY: Same as above.
 unsafe impl Sync for MtmdBitmap {}
 
 impl MtmdBitmap {
@@ -389,7 +413,7 @@ impl MtmdBitmap {
 
         let bitmap = unsafe { llama_cpp_sys_2::mtmd_bitmap_init(nx, ny, data.as_ptr()) };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        let bitmap = Ptr::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
@@ -424,7 +448,7 @@ impl MtmdBitmap {
         let bitmap =
             unsafe { llama_cpp_sys_2::mtmd_bitmap_init_from_audio(data.len(), data.as_ptr()) };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        let bitmap = Ptr::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
@@ -440,6 +464,9 @@ impl MtmdBitmap {
     ///
     /// * `ctx` - MTMD context for processing
     /// * `path` - Path to the image or audio file
+    /// * `placeholder` - If `true`, build a data-less bitmap (dimensions/length only, with no
+    ///   decoded pixels or audio samples) — useful for counting tokens without loading the media.
+    ///   If `false`, decode and load the actual data.
     ///
     /// # Returns
     ///
@@ -451,16 +478,26 @@ impl MtmdBitmap {
     /// * `NullResult` - File could not be loaded or processed
     ///
     /// This function is thread-safe.
-    pub fn from_file(ctx: &MtmdContext, path: &str) -> Result<Self, MtmdBitmapError> {
+    pub fn from_file(
+        ctx: &MtmdContext,
+        path: &str,
+        placeholder: bool,
+    ) -> Result<Self, MtmdBitmapError> {
         let path_cstr = CString::new(path)?;
-        let bitmap = unsafe {
+        // This helper now returns a wrapper struct (bitmap + an optional video
+        // decoding context) instead of a bare pointer. `video_ctx` is only set
+        // when MTMD_VIDEO is enabled at compile time; this crate does not build
+        // with it on, so it is always null here and only the bitmap matters.
+        let wrapper = unsafe {
             llama_cpp_sys_2::mtmd_helper_bitmap_init_from_file(
                 ctx.context.as_ptr(),
                 path_cstr.as_ptr(),
+                placeholder,
+                llama_cpp_sys_2::mtmd_helper_init_opt_default(),
             )
         };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        let bitmap = Ptr::new(wrapper.bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
@@ -476,6 +513,9 @@ impl MtmdBitmap {
     ///
     /// * `ctx` - MTMD context for processing
     /// * `data` - Buffer containing the file data
+    /// * `placeholder` - If `true`, build a data-less bitmap (dimensions/length only, with no
+    ///   decoded pixels or audio samples) — useful for counting tokens without loading the media.
+    ///   If `false`, decode and load the actual data.
     ///
     /// # Returns
     ///
@@ -486,16 +526,24 @@ impl MtmdBitmap {
     /// * `NullResult` - Buffer could not be processed
     ///
     /// This function is thread-safe.
-    pub fn from_buffer(ctx: &MtmdContext, data: &[u8]) -> Result<Self, MtmdBitmapError> {
-        let bitmap = unsafe {
+    pub fn from_buffer(
+        ctx: &MtmdContext,
+        data: &[u8],
+        placeholder: bool,
+    ) -> Result<Self, MtmdBitmapError> {
+        // See the comment in `from_file`: this returns a wrapper struct now, and
+        // `video_ctx` is always null since MTMD_VIDEO is not enabled in this build.
+        let wrapper = unsafe {
             llama_cpp_sys_2::mtmd_helper_bitmap_init_from_buf(
                 ctx.context.as_ptr(),
                 data.as_ptr(),
                 data.len(),
+                placeholder,
+                llama_cpp_sys_2::mtmd_helper_init_opt_default(),
             )
         };
 
-        let bitmap = NonNull::new(bitmap).ok_or(MtmdBitmapError::NullResult)?;
+        let bitmap = Ptr::new(wrapper.bitmap).ok_or(MtmdBitmapError::NullResult)?;
         Ok(Self { bitmap })
     }
 
@@ -526,6 +574,12 @@ impl MtmdBitmap {
     #[must_use]
     pub fn is_audio(&self) -> bool {
         unsafe { llama_cpp_sys_2::mtmd_bitmap_is_audio(self.bitmap.as_ptr()) }
+    }
+
+    /// Check if this bitmap contains voice data.
+    #[must_use]
+    pub fn is_voice(&self) -> bool {
+        unsafe { llama_cpp_sys_2::mtmd_bitmap_is_voice(self.bitmap.as_ptr()) }
     }
 
     /// Get the bitmap's optional ID string.
@@ -562,16 +616,16 @@ impl MtmdBitmap {
     ///
     /// ```no_run
     /// # use llama_cpp_2::mtmd::MtmdBitmap;
-    /// # fn example(bitmap: &MtmdBitmap) -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn example(bitmap: &mut MtmdBitmap) -> Result<(), Box<dyn std::error::Error>> {
     /// bitmap.set_id("image_001")?;
     /// assert_eq!(bitmap.id(), Some("image_001".to_string()));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn set_id(&self, id: &str) -> Result<(), std::ffi::NulError> {
+    pub fn set_id(&mut self, id: &str) -> Result<(), std::ffi::NulError> {
         let id_cstr = CString::new(id)?;
         unsafe {
-            llama_cpp_sys_2::mtmd_bitmap_set_id(self.bitmap.as_ptr(), id_cstr.as_ptr());
+            llama_cpp_sys_2::mtmd_bitmap_set_id(self.bitmap.as_mut_ptr(), id_cstr.as_ptr());
         }
         Ok(())
     }
@@ -579,7 +633,7 @@ impl MtmdBitmap {
 
 impl Drop for MtmdBitmap {
     fn drop(&mut self) {
-        unsafe { llama_cpp_sys_2::mtmd_bitmap_free(self.bitmap.as_ptr()) }
+        unsafe { llama_cpp_sys_2::mtmd_bitmap_free(self.bitmap.as_mut_ptr()) }
     }
 }
 
@@ -590,8 +644,13 @@ impl Drop for MtmdBitmap {
 /// with text chunks containing tokens and media chunks containing embeddings.
 #[derive(Debug)]
 pub struct MtmdInputChunks {
-    pub(crate) chunks: NonNull<llama_cpp_sys_2::mtmd_input_chunks>,
+    chunks: Ptr<llama_cpp_sys_2::mtmd_input_chunks>,
 }
+
+// SAFETY: `mtmd_input_chunks` is thread-safe, it's just a list of chunks.
+unsafe impl Send for MtmdInputChunks {}
+// SAFETY: Same as above.
+unsafe impl Sync for MtmdInputChunks {}
 
 impl Default for MtmdInputChunks {
     fn default() -> Self {
@@ -617,7 +676,7 @@ impl MtmdInputChunks {
     #[must_use]
     pub fn new() -> Self {
         let chunks = unsafe { llama_cpp_sys_2::mtmd_input_chunks_init() };
-        let chunks = NonNull::new(chunks).unwrap();
+        let chunks = Ptr::new(chunks).unwrap();
         Self { chunks }
     }
 
@@ -633,9 +692,31 @@ impl MtmdInputChunks {
         self.len() == 0
     }
 
-    /// Get a chunk by index
+    /// Get a chunk by index.
+    ///
+    /// The returned chunk borrows from this collection. Dropping the collection
+    /// while a borrowed chunk is still in use is a compile error. Use
+    /// [`MtmdInputChunk::copy`] if you need a chunk that outlives the collection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use llama_cpp_2::mtmd::MtmdInputChunks;
+    ///
+    /// let chunks = MtmdInputChunks::new();
+    /// assert!(chunks.get(0).is_none());
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use llama_cpp_2::mtmd::MtmdInputChunks;
+    ///
+    /// let chunks = MtmdInputChunks::new();
+    /// let chunk = chunks.get(0);
+    /// drop(chunks);
+    /// let _ = chunk;
+    /// ```
     #[must_use]
-    pub fn get(&self, index: usize) -> Option<MtmdInputChunk> {
+    pub fn get(&self, index: usize) -> Option<MtmdInputChunk<'_>> {
         if index >= self.len() {
             return None;
         }
@@ -644,9 +725,10 @@ impl MtmdInputChunks {
             unsafe { llama_cpp_sys_2::mtmd_input_chunks_get(self.chunks.as_ptr(), index) };
 
         // Note: We don't own this chunk, it's owned by the chunks collection
-        NonNull::new(chunk_ptr.cast_mut()).map(|ptr| MtmdInputChunk {
+        Ptr::new(chunk_ptr.cast_mut()).map(|ptr| MtmdInputChunk {
             chunk: ptr,
             owned: false,
+            phantom: PhantomData,
         })
     }
 
@@ -696,8 +778,8 @@ impl MtmdInputChunks {
     /// This function is NOT thread-safe.
     pub fn eval_chunks(
         &self,
-        mtmd_ctx: &MtmdContext,
-        llama_ctx: &LlamaContext,
+        mtmd_ctx: &mut MtmdContext,
+        llama_ctx: &mut LlamaContext,
         n_past: llama_cpp_sys_2::llama_pos,
         seq_id: llama_cpp_sys_2::llama_seq_id,
         n_batch: i32,
@@ -707,8 +789,8 @@ impl MtmdInputChunks {
 
         let result = unsafe {
             llama_cpp_sys_2::mtmd_helper_eval_chunks(
-                mtmd_ctx.context.as_ptr(),
-                llama_ctx.context.as_ptr(),
+                mtmd_ctx.context.as_mut_ptr(),
+                llama_ctx.context.as_mut_ptr(),
                 self.chunks.as_ptr(),
                 n_past,
                 seq_id,
@@ -728,7 +810,7 @@ impl MtmdInputChunks {
 
 impl Drop for MtmdInputChunks {
     fn drop(&mut self) {
-        unsafe { llama_cpp_sys_2::mtmd_input_chunks_free(self.chunks.as_ptr()) }
+        unsafe { llama_cpp_sys_2::mtmd_input_chunks_free(self.chunks.as_mut_ptr()) }
     }
 }
 
@@ -737,13 +819,23 @@ impl Drop for MtmdInputChunks {
 /// Represents a single chunk of input data, which can be either text tokens,
 /// image tokens, or audio tokens. The chunk type determines what kind of
 /// data and operations are available.
+///
+/// `'a` is the lifetime of the [`MtmdInputChunks`] this chunk was borrowed
+/// from via [`MtmdInputChunks::get`]. [`MtmdInputChunk::copy`] returns an
+/// owned chunk with a `'static` lifetime that is freed independently.
 #[derive(Debug)]
-pub struct MtmdInputChunk {
-    pub(crate) chunk: NonNull<llama_cpp_sys_2::mtmd_input_chunk>,
+pub struct MtmdInputChunk<'a> {
+    chunk: Ptr<llama_cpp_sys_2::mtmd_input_chunk>,
     owned: bool,
+    phantom: PhantomData<&'a MtmdInputChunks>,
 }
 
-impl MtmdInputChunk {
+// SAFETY: `mtmd_input_chunks` is thread-safe, it's POD.
+unsafe impl Send for MtmdInputChunk<'_> {}
+// SAFETY: Same as above.
+unsafe impl Sync for MtmdInputChunk<'_> {}
+
+impl MtmdInputChunk<'_> {
     /// Get the type of this chunk
     #[must_use]
     pub fn chunk_type(&self) -> MtmdInputChunkType {
@@ -820,6 +912,9 @@ impl MtmdInputChunk {
     /// (e.g., KV cache management) by moving the chunk ownership to your own code.
     /// Remember to ensure the copied chunk is properly freed when you're done with it.
     ///
+    /// The copy does not borrow from the original collection, so it can
+    /// outlive the [`MtmdInputChunks`] this chunk was taken from.
+    ///
     /// # Returns
     ///
     /// Returns an owned copy of the chunk.
@@ -827,17 +922,21 @@ impl MtmdInputChunk {
     /// # Errors
     ///
     /// Returns `MtmdInputChunkError::NullResult` if copying fails.
-    pub fn copy(&self) -> Result<Self, MtmdInputChunkError> {
+    pub fn copy(&self) -> Result<MtmdInputChunk<'static>, MtmdInputChunkError> {
         let chunk = unsafe { llama_cpp_sys_2::mtmd_input_chunk_copy(self.chunk.as_ptr()) };
-        let chunk = NonNull::new(chunk).ok_or(MtmdInputChunkError::NullResult)?;
-        Ok(Self { chunk, owned: true })
+        let chunk = Ptr::new(chunk).ok_or(MtmdInputChunkError::NullResult)?;
+        Ok(MtmdInputChunk {
+            chunk,
+            owned: true,
+            phantom: PhantomData,
+        })
     }
 }
 
-impl Drop for MtmdInputChunk {
+impl Drop for MtmdInputChunk<'_> {
     fn drop(&mut self) {
         if self.owned {
-            unsafe { llama_cpp_sys_2::mtmd_input_chunk_free(self.chunk.as_ptr()) }
+            unsafe { llama_cpp_sys_2::mtmd_input_chunk_free(self.chunk.as_mut_ptr()) }
         }
     }
 }
