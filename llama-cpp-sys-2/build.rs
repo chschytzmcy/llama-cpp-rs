@@ -1085,8 +1085,32 @@ fn main() {
         // Rerun if prebuilt libs change
         println!("cargo:rerun-if-changed={}", prebuilt_path.display());
 
-        // Skip cmake build - just compile wrapper and link prebuilt libs
-        common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
+        // Skip cmake build - just compile wrapper and link prebuilt libs.
+        // (2026-11-21 bump:上游把 `common_wrapper_build` 收进了
+        // `if cfg!(feature = "common")` 块且在 prebuilt 早退之后 —— 预编译
+        // 路径拿不到,这里镜像上游 492-523 行的构造,内联编 wrapper。)
+        {
+            let mut common_wrapper_build = cc::Build::new();
+            common_wrapper_build
+                .cpp(true)
+                .file("wrapper_common.cpp")
+                .include(&llama_src)
+                .include(llama_src.join("common"))
+                .include(llama_src.join("include"))
+                .include(llama_src.join("ggml/include"))
+                .include(llama_src.join("vendor"))
+                .std("c++17")
+                .pic(true);
+            if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {
+                common_wrapper_build.flag("/EHsc");
+            }
+            if matches!(target_os, TargetOs::Apple(_))
+                || (matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx"))
+            {
+                common_wrapper_build.cpp_link_stdlib(None);
+            }
+            common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
+        }
 
         // Write bindings (already generated above)
         // No-op since bindings were generated before this check,
